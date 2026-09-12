@@ -1,0 +1,20 @@
+name: Trusted release
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create trusted subject
+        shell: bash
+        run: printf 'TRUSTED_RELEASE_ONLY\n' > trusted.txt
+      - name: Attest trusted subject
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: trusted.txt
