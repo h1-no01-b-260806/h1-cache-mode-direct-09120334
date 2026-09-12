@@ -1,0 +1,36 @@
+name: Case-only attestation signer
+
+on:
+  push:
+    branches:
+      - Main
+    paths:
+      - case-only-3cdb985a52b064fc.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm this job cannot read the private consumer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status="$(curl --silent --show-error --output /tmp/consumer-response --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/h1-no01-b-260806/h1-attestation-consumer-09120350)"
+          echo "direct_consumer_http=$status"
+          test "$status" = "404"
+
+      - name: Attest the unique candidate
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: case-only-3cdb985a52b064fc.sh
