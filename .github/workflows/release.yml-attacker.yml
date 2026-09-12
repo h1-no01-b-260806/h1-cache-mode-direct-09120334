@@ -1,0 +1,23 @@
+name: Sibling workflow attestation
+on:
+  push:
+    branches:
+      - Main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create subject
+        shell: bash
+        run: printf 'GH_ATTEST_POLICY_CANARY_v1\n' > artifact.txt
+      - name: Attest subject
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: artifact.txt
