@@ -17,7 +17,69 @@ jobs:
       - name: Create subject
         shell: bash
         run: printf 'GH_ATTEST_POLICY_CANARY_v1\n' > artifact.txt
+
       - name: Attest subject
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: artifact.txt
+
+      - name: Verify exact and mismatched policies
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          repo="$GITHUB_REPOSITORY"
+          actual="$repo/.github/workflows/release.yml-attacker.yml"
+          trusted="$repo/.github/workflows/release.yml"
+
+          check_policy() {
+            label="$1"
+            shift
+            gh attestation verify artifact.txt --repo "$repo" --format json "$@" >"/tmp/$label.json" 2>"/tmp/$label.err"
+            CHECK_RC=$?
+            echo "CASE $label exit=$CHECK_RC"
+            if [ "$CHECK_RC" -eq 0 ]; then
+              jq -r '.[0].verificationResult.signature.certificate | "certificate_ref=" + .sourceRepositoryRef, "certificate_san=" + .subjectAlternativeName, "certificate_signer=" + .buildSignerURI' "/tmp/$label.json"
+            else
+              tail -n 2 "/tmp/$label.err"
+            fi
+          }
+
+          gh --version | head -n 1
+
+          for retry in 1 2 3 4 5 6; do
+            check_policy baseline --source-ref refs/heads/Main --signer-workflow "$actual"
+            baseline_rc=$CHECK_RC
+            [ "$baseline_rc" -eq 0 ] && break
+            sleep 5
+          done
+
+          check_policy case_ref_only --source-ref refs/heads/main --signer-workflow "$actual"
+          case_ref_rc=$CHECK_RC
+
+          check_policy workflow_prefix_only --source-ref refs/heads/Main --signer-workflow "$trusted"
+          workflow_prefix_rc=$CHECK_RC
+
+          check_policy combined_bypass --source-ref refs/heads/main --signer-workflow "$trusted"
+          combined_rc=$CHECK_RC
+
+          check_policy unrelated_ref --source-ref refs/heads/not-main --signer-workflow "$actual"
+          unrelated_ref_rc=$CHECK_RC
+
+          check_policy unrelated_workflow --source-ref refs/heads/Main --signer-workflow "$repo/.github/workflows/unrelated.yml"
+          unrelated_workflow_rc=$CHECK_RC
+
+          echo "SUMMARY baseline=$baseline_rc case_ref=$case_ref_rc workflow_prefix=$workflow_prefix_rc combined=$combined_rc unrelated_ref=$unrelated_ref_rc unrelated_workflow=$unrelated_workflow_rc"
+
+          if [ "$baseline_rc" -eq 0 ] &&
+             [ "$case_ref_rc" -eq 0 ] &&
+             [ "$workflow_prefix_rc" -eq 0 ] &&
+             [ "$combined_rc" -eq 0 ] &&
+             [ "$unrelated_ref_rc" -ne 0 ] &&
+             [ "$unrelated_workflow_rc" -ne 0 ]; then
+            echo "ATTESTATION_POLICY_BYPASS_CONFIRMED"
+          else
+            echo "ATTESTATION_POLICY_MATRIX_UNEXPECTED"
+            exit 1
+          fi
